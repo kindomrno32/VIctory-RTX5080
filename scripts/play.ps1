@@ -21,7 +21,12 @@ $settings = @{
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
-    $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    # RTX 5080 / Ryzen 9 9950X, runs 5-11 of 2026-11-25 (same cell, same settings but one):
+    #  - VICTORY_THIN with its eight threads ghosts the picture unless a list's views are made
+    #    for every table (VICTORY_LIST_VIEWS=0); with one thread, or with that off, it is sharp.
+    #  - VICTORY_JOIN_PARTS=8 blurs and bleaches the picture and makes the intro stutter:
+    #    left out here until it is found why (-More @{VICTORY_JOIN_PARTS='8'} puts it back).
+    $settings.VICTORY_THIN = '1'; $settings.VICTORY_LIST_VIEWS = '0'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
