@@ -520,6 +520,26 @@ pub(super) fn branches_around(st: &Structured, needs: &[usize]) -> Option<Vec<us
     Some(out)
 }
 
+/// The per-lane branches (by block) that have a wave-wide meaning ([`Structured::wave_any`]).
+pub(super) fn lane_branches(st: &Structured) -> Vec<usize> {
+    lane_regions(st)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(d, _)| d)
+        .filter(|&d| st.wave_any.get(d).copied().flatten().is_some())
+        .collect()
+}
+
+/// The per-lane branches (by block) without a wave-wide meaning (diagnostics).
+pub(super) fn lane_branches_left(st: &Structured) -> Vec<usize> {
+    lane_regions(st)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(d, _)| d)
+        .filter(|&d| st.wave_any.get(d).copied().flatten().is_none())
+        .collect()
+}
+
 /// Whether a refusal is of code that needs every lane of the wave where it stands (two host
 /// waves meeting there), which the other forms of the program may give it.
 pub(super) fn needs_every_lane(what: &str) -> bool {
@@ -1160,7 +1180,29 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+thread_local! {
+    /// See [`with_pair`].
+    static PAIR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with console wave64 compute programs lowered as for a host of 64-lane waves
+/// and then made to run two console lanes a host thread (`bitcode::pair`): a host wave of
+/// 32 threads holds a console wave whole, and nothing is exchanged at barriers.
+pub(super) fn with_pair<R>(f: impl FnOnce() -> R) -> R {
+    let was = PAIR.replace(true);
+    let r = f();
+    PAIR.set(was);
+    r
+}
+
+fn pair() -> bool {
+    PAIR.get()
+}
+
 pub(super) fn host_max_wave() -> u32 {
+    if pair() {
+        return 64;
+    }
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
@@ -1413,7 +1455,9 @@ impl<'a> Lower<'a> {
                     || reads_mask_as_data(x.st, i)
             }) || lane_constant_masks(x.st)
                 // (a branch the wave takes together asks the wave)
-                || !x.st.wide.is_empty();
+                || !x.st.wide.is_empty()
+                // (two lanes a thread: a thread's index is taken from its lanes)
+                || pair() && x.native.wave64;
             let mut wave = if x.native.wave64 { 64 } else { 32 };
             let group = cs.threads.iter().product::<u32>();
             let one_wave = group <= wave;
@@ -2310,6 +2354,10 @@ impl<'a> Lower<'a> {
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
         let p = self.x.p;
+        let paired = pair() && self.x.native.wave64 && matches!(self.x.native.io, StageIo::Cs(_));
+        if paired && (counted || self.s.threads.is_none_or(|t| t.iter().product::<u32>() % 64 != 0)) {
+            return Err(unsupported(0, "two lanes a thread in a group that is not whole console waves"));
+        }
         if counted {
             // Before anything else, so that wave counts, reads of the first
             // lane and stores know only the lanes that run.
@@ -2415,6 +2463,13 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if paired {
+            // (`bitcode::pair`) half the console's threads in one row, in host waves of 32
+            self.s.m.pair(self.abort).map_err(|why| unsupported(0, why))?;
+            let threads = self.s.threads.expect("compute").iter().product::<u32>();
+            self.s.threads = Some([threads / 2, 1, 1]);
+            self.s.wave_size = Some(32);
+        }
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -12447,6 +12502,11 @@ impl<'a> Lower<'a> {
                         };
                         self.enter_loop(b, to, from);
                     }
+                }
+                if self.x.st.wide.contains(&b)
+                    || self.x.st.bools.support(when).iter().all(|a| matches!(a, Atom::Uniform(_)))
+                {
+                    self.s.m.together.insert(self.cur);
                 }
                 Term::CondBr(cond, t, f)
             }

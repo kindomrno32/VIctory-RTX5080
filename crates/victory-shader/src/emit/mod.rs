@@ -465,6 +465,17 @@ pub fn emit(
             }
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
+        // Two console lanes a host thread (`bitcode::pair`): the program as a host of
+        // 64-lane waves runs it, a host wave of 32 threads holding a console wave whole.
+        // Exact wherever it translates, with no barrier of ours and so no wait: before
+        // every form below (`VICTORY_WAVE_PAIR=0`: not tried).
+        if pair_on() {
+            let again = paired(c, native, p, st, io, res, why);
+            report("two lanes a thread", &again);
+            if done(&again) {
+                return again.map(|(shader, _)| shader);
+            }
+        }
         // Each host wave as a wave of its own (`lower::with_local_waves`),
         // for programs still stopped where not every lane runs.
         let local_on = std::env::var_os("VICTORY_WAVE_LOCAL").is_none_or(|v| v != "0");
@@ -626,6 +637,91 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Whether a console wave64 compute program that the host's waves of 32 cannot run as it is
+/// is tried with two console lanes a host thread first (`VICTORY_WAVE_PAIR`; `0`: not).
+fn pair_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_PAIR").is_none_or(|v| v != "0"))
+}
+
+/// `p` with two console lanes a host thread ([`lower::with_pair`]): as it is, and where a
+/// wave operation then stands in a region a thread's two lanes may be apart in, once more
+/// with every per-lane branch that has a wave-wide meaning taken wave-wide (the host's
+/// wave is the console's there, so the wave's own answer decides and nothing is exchanged).
+fn paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    why: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let first = lower::with_pair(|| emit_program(c, native, p, st, io, res));
+    lower::take_needs();
+    if first.is_ok() {
+        return first;
+    }
+    // Every per-lane branch that has a wave-wide meaning, taken wave-wide.
+    let wide = |p: &ir::Program| -> Result<(HostShader, Option<u32>), ShaderError> {
+        let mut wide = std::collections::HashSet::new();
+        loop {
+            let st = structure::structure_wide(p, &wide)?;
+            let more: Vec<usize> =
+                lower::lane_branches(&st).into_iter().filter(|b| !wide.contains(b)).collect();
+            if more.is_empty() {
+                let io = io::raise(p, native)?;
+                let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+                if why {
+                    eprintln!("WAVE64-PAIR {} branches taken wave-wide", wide.len());
+                    for d in lower::lane_branches_left(&st) {
+                        let last = p.blocks[d].insts.last().map(|i| i.name().to_owned()).unwrap_or_default();
+                        eprintln!(
+                            "WAVE64-PAIR-LEFT block {d} at {:#x}: {last}, exit {:?}",
+                            p.blocks[d].offset, st.exits[d]
+                        );
+                    }
+                }
+                let r = lower::with_pair(|| emit_program(c, native, p, &st, &io, &res));
+                lower::take_needs();
+                return r;
+            }
+            wide.extend(more);
+        }
+    };
+    let again = wide(p);
+    if again.is_ok() {
+        return again;
+    }
+    if why && let Err(e) = &again {
+        eprintln!("WAVE64-PAIR wave-wide: {e}");
+    }
+    // The lanes that would leave at once walk the body with EXEC clear instead
+    // ([`ir::without_early_outs`]): no lane's own way to the program's end.
+    if let Some(q) = ir::without_early_outs(p)
+        && let Ok(st) = structure::structure(&q)
+        && let Ok(io) = io::raise(&q, native)
+        && let Ok(res) = resource::track(&q, &native.layout, native.stage, Some(&st))
+    {
+        let r = lower::with_pair(|| emit_program(c, native, &q, &st, &io, &res));
+        lower::take_needs();
+        if r.is_ok() {
+            return r;
+        }
+        if why && let Err(e) = &r {
+            eprintln!("WAVE64-PAIR without early-outs: {e}");
+        }
+        let r = wide(&q);
+        if r.is_ok() {
+            return r;
+        }
+        if why && let Err(e) = &r {
+            eprintln!("WAVE64-PAIR without early-outs, wave-wide: {e}");
+        }
+    }
+    first
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane

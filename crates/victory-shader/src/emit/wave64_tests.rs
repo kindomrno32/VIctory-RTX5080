@@ -241,14 +241,74 @@ fn some_lane_of_a_mask_is_a_number_the_whole_wave_agrees_on() {
         0x8002_0200, // buffer_store_dword v2, off, s[8:11], 0
     ]);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = on_64_lanes(&native, &p);
-    // (lane s0 waits, if there is one; s1 rounds)
-    for (wait, rounds, done) in [(0, 0, 0), (37, 4, 0), (63, 4, 0), (64, 0, 1), (37, 5, 1), (64, 9, 1)] {
-        let Some(out) = dispatched(&shader, &[wait, rounds]) else {
-            return;
-        };
-        assert_eq!(out, done, "lane {wait} after {rounds} rounds");
+    for (form, shader) in [("two lanes a thread", two_lanes(&native, &p)), ("64 lanes", on_64_lanes(&native, &p))] {
+        // (lane s0 waits, if there is one; s1 rounds)
+        for (wait, rounds, done) in [(0, 0, 0), (37, 4, 0), (63, 4, 0), (64, 0, 1), (37, 5, 1), (64, 9, 1)] {
+            let Some(out) = dispatched(&shader, &[wait, rounds]) else {
+                break;
+            };
+            assert_eq!(out, done, "{form}: lane {wait} after {rounds} rounds");
+            eprintln!("{form}: lane {wait} after {rounds} rounds: {out}");
+        }
     }
+}
+
+/// `native` with two console lanes a host thread (`bitcode::pair`), for a host of 32-lane
+/// waves: as it is, with every per-lane branch that has a wave-wide meaning taken wave-wide,
+/// and both again without its early-outs, as `emit` tries them.
+fn two_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
+    let attempt = |p: &ir::Program, all_wide: bool| -> Result<HostShader, ShaderError> {
+        let mut wide = HashSet::new();
+        loop {
+            let st = structure::structure_wide(p, &wide)?;
+            if all_wide {
+                let more: Vec<usize> = lower::lane_branches(&st).into_iter().filter(|b| !wide.contains(b)).collect();
+                if !more.is_empty() {
+                    wide.extend(more);
+                    continue;
+                }
+            }
+            let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+            let io = io::raise(p, native)?;
+            let lowered = lower::with_pair(|| {
+                lower::lower(&lower::Parts {
+                    native,
+                    p,
+                    st: &st,
+                    io: &io,
+                    res: &res,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                    prims: Vec::new(),
+                    mesh_stride: 0,
+                })
+            })?;
+            assert_eq!(lowered.wave_size, Some(32));
+            return Ok(HostShader {
+                stage: HwStage::Cs,
+                dxil: lowered.dxil,
+                user_data: lowered.user_data,
+                samplers: lowered.samplers,
+                static_samplers: Vec::new(),
+                root_cbvs: lowered.root_cbvs,
+                root_srvs: lowered.root_srvs,
+                root_uavs: lowered.root_uavs,
+                root_indexed_views: res.root_indexed_views,
+            });
+        }
+    };
+    let shader = attempt(p, false)
+        .or_else(|_| attempt(p, true))
+        .or_else(|first| match ir::without_early_outs(p) {
+            Some(q) => attempt(&q, false).or_else(|_| attempt(&q, true)),
+            None => Err(first),
+        })
+        .expect("two lanes a thread");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    shader
 }
 
 /// `native` for a host of 64-lane waves.
@@ -349,7 +409,7 @@ fn a_sum_of_halves_where_not_every_lane_runs_on_a_wave_of_64() {
     ]);
     let native = native(&words);
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let shader = on_64_lanes(&native, &p);
+    let shaders = [("two lanes a thread", two_lanes(&native, &p)), ("64 lanes", on_64_lanes(&native, &p))];
     let wide = |h: u16| match h {
         0 => 0.0,
         h => f32::from_bits((u32::from(h >> 10) + 112) << 23 | u32::from(h & 0x3FF) << 13),
@@ -363,15 +423,19 @@ fn a_sum_of_halves_where_not_every_lane_runs_on_a_wave_of_64() {
         let rest = b & 0x1FFF;
         (h + u32::from(rest > 0x1000 || rest == 0x1000 && h & 1 == 1)) as u16
     };
-    for from in [0u32, 1, 5, 31, 32, 37, 63] {
-        let mut tree: Vec<u16> = (0..64u16).map(|t| if u32::from(t) < from { 0 } else { 0x3C00 + 37 * t }).collect();
-        while tree.len() > 1 {
-            tree = tree.chunks(2).map(|c| narrow(wide(c[0]) + wide(c[1]))).collect();
+    for (form, shader) in &shaders {
+        for from in [0u32, 1, 5, 31, 32, 37, 63] {
+            let mut tree: Vec<u16> =
+                (0..64u16).map(|t| if u32::from(t) < from { 0 } else { 0x3C00 + 37 * t }).collect();
+            while tree.len() > 1 {
+                tree = tree.chunks(2).map(|c| narrow(wide(c[0]) + wide(c[1]))).collect();
+            }
+            let Some(out) = dispatched(shader, &[from]) else {
+                break;
+            };
+            assert_eq!(out, u32::from(tree[0]), "{form}: lanes from {from}");
+            eprintln!("{form}: lanes from {from}: {out:#x}");
         }
-        let Some(out) = dispatched(&shader, &[from]) else {
-            return;
-        };
-        assert_eq!(out, u32::from(tree[0]), "lanes from {from}");
     }
 }
 
@@ -406,6 +470,7 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
         let mut copy = shader.dxil.clone();
         v.validate(&mut copy).expect("DXIL validation failed");
     }
+    let shaders = [("two lanes a thread", two_lanes(&native, &p)), ("64 lanes", shader)];
     let wide = |h: u16| {
         if h == 0 {
             0.0
@@ -424,24 +489,31 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
     };
     let add = |a: u16, b: u16| narrow(wide(a) + wide(b));
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut ran = false;
-    for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
-        let terms: Vec<u16> = (0..64u32)
-            .map(|t| if t < stay { (0x3C00 + 37 * t) as u16 } else { 0 })
-            .collect();
-        let mut tree = terms.clone();
-        while tree.len() > 1 {
-            tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
+    for (form, shader) in &shaders {
+        let mut ran = false;
+        for stay in [64u32, 63, 40, 33, 32, 17, 5, 1] {
+            let terms: Vec<u16> = (0..64u32)
+                .map(|t| if t < stay { (0x3C00 + 37 * t) as u16 } else { 0 })
+                .collect();
+            let mut tree = terms.clone();
+            while tree.len() > 1 {
+                tree = tree.chunks(2).map(|c| add(c[0], c[1])).collect();
+            }
+            let Some(got) = on_the_card(shader, [stay, 0]) else {
+                break;
+            };
+            ran = true;
+            // (the high half is lane 0's term's: zero)
+            assert_eq!(
+                got,
+                u32::from(tree[0]),
+                "{form}: {stay} lanes stay: got {got:#x}, the console's tree {:#x}",
+                tree[0]
+            );
         }
-        let Some(got) = on_the_card(&shader, [stay, 0]) else {
-            return;
-        };
-        ran = true;
-        // (the high half is lane 0's term's: zero)
-        assert_eq!(got, u32::from(tree[0]), "{stay} lanes stay: got {got:#x}, the console's tree {:#x}", tree[0]);
-    }
-    if ran {
-        eprintln!("ran on the hardware device: the console's tree with lanes gone, in every case");
+        if ran {
+            eprintln!("{form}: ran on the hardware device: the console's tree with lanes gone, in every case");
+        }
     }
 }
 
@@ -734,5 +806,49 @@ fn the_lanes_past_a_count_of_threads_do_not_run() {
             let i = i as u32;
             assert_eq!(word, u32::from(i < active) + u32::from(i + 64 < active), "count {count}, word {i}");
         }
+    }
+}
+
+/// Two lanes a thread in a group of several console waves: every console thread index is
+/// some thread's lane, once. (The pairing takes a thread's index from the host wave's
+/// lanes and the 32-aligned run of the halved group's indices the wave holds; a host that
+/// laid its waves out otherwise would give two threads one index and leave another out.)
+#[test]
+fn two_lanes_a_thread_cover_a_group_of_several_waves() {
+    for threads in [64u32, 128, 256, 512] {
+        let native = native_of(
+            &[
+                0x340E_0082, // v_lshlrev_b32 v7, 2, v0
+                0x4A00_0081, // v_add_nc_u32 v0, 1, v0
+                0xE070_1000,
+                0x8002_0007, // buffer_store_dword v0, v7, s[8:11], 0 offen
+            ],
+            true,
+            threads,
+        );
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let shader = two_lanes(&native, &p);
+        let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let Ok(host) = Host::new(false) else {
+            eprintln!("no SM 6.6 hardware device; not run");
+            return;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("the pipeline");
+        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(threads)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+        let want: Vec<u32> = (1..=threads).collect();
+        assert_eq!(&out[0][..threads as usize], &want[..], "{threads} threads");
+        eprintln!("two lanes a thread: {threads} threads, every index once");
     }
 }

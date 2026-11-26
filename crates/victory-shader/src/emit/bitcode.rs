@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 pub mod census;
 pub mod opt;
+pub(crate) mod pair;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);
@@ -226,6 +227,10 @@ pub(crate) struct Module {
     named: Vec<(String, Vec<Md>)>,
     /// See [`Tag`]: by instruction.
     tags: HashMap<u32, Tag>,
+    /// Blocks whose closing branch every lane of a wave takes the same way, as the
+    /// lowering knows of the console's branch it stands for (a scalar condition, or a
+    /// branch taken wave-wide): [`pair`] goes by it.
+    pub(crate) together: std::collections::HashSet<usize>,
 }
 
 impl Module {
